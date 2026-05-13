@@ -9,6 +9,7 @@ from evaluation import eva
 
 import os
 import argparse
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -25,7 +26,14 @@ def trainer(dataset):
     ).to(device)
     print(model_GAT)
     # 加载预训练权重模型
-    model_GAT.load_state_dict(torch.load(args.pretrain_path, map_location='cpu'))
+    if args.pretrain_path and os.path.exists(args.pretrain_path):
+        try:
+            model_GAT.load_state_dict(torch.load(args.pretrain_path, map_location='cpu'))
+        except RuntimeError as exc:
+            print("Could not load pretrain weights from {}: {}".format(args.pretrain_path, exc))
+            print("Continuing with randomly initialized GAT weights.")
+    else:
+        print("Pretrain weights not found. Continuing with randomly initialized GAT weights.")
 
     # data process
     dataset = utils.data_preprocessing(dataset)
@@ -82,20 +90,21 @@ def trainer(dataset):
 
 
     # 测试
-    y_new = [int(y[i]) for i in realiable_sample]
-    y_pred_new = [int(y_pred[i]) for i in realiable_sample]
+    if len(realiable_sample) == 0:
+        realiable_sample = np.arange(features.shape[0]).reshape(-1, 1)
+    y_new = [int(y[i[0]]) for i in realiable_sample]
+    y_pred_new = [int(y_pred[i[0]]) for i in realiable_sample]
     eva(y_new, y_pred_new, 'pretrain-可信赖样本', show=True)
     print(Counter(y_pred_new))
     print(Counter(y))
 
     # 自监督学习  # x, y, adj, y_pre, sample_index)
-    train_self_supervised(x=data, y=y, adj=adj, y_pred=y_pred, sample_index=realiable_sample, epoch=400)
+    return train_self_supervised(x=data, y=y, adj=adj, y_pred=y_pred, sample_index=realiable_sample, epoch=args.epochs)
 
 
 def train_self_supervised(x, y, adj, y_pred, sample_index, epoch=200):
     # 初始化模型
     sample_index = [i[0] for i in sample_index]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # x, y, adj, y_pred = x.to(device), torch.LongTensor(y).to(device), adj.to(device), torch.LongTensor(y_pred).to(device)
     x, adj, y_pred = x.to(device), adj.to(device), torch.LongTensor(y_pred).to(device)
     print("自监督训练开始,  GAT模型结构图：")
@@ -106,6 +115,7 @@ def train_self_supervised(x, y, adj, y_pred, sample_index, epoch=200):
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-5)
     acc_best = 0;
+    best_labels = None
     for i in range(epoch):
         model.train()
         optimizer.zero_grad()
@@ -122,18 +132,27 @@ def train_self_supervised(x, y, adj, y_pred, sample_index, epoch=200):
         acc_test, nmi_test, ari_test, f1_test = eva(y_pre_GAT, y, 'Test: {}'.format(i))
         if acc_test > acc_best:
             acc_best = acc_test
+            best_labels = y_pre_GAT.astype(np.int64)
             torch.save(model.state_dict(), f"pretrain/self_GCN_{args.name}_{i}_{acc_best}.pkl")
             print(f"epoch - Train {i}:acc {acc_train:.4f}, nmi {nmi_train:.4f}, ari {ari_train:.4f}, f1 {f1_train:.4f}")
             print(f"epoch {i}:acc {acc_test:.4f}, nmi {nmi_test:.4f}, ari {ari_test:.4f}, f1 {f1_test:.4f}")
+    if best_labels is None:
+        best_labels = y_pre_GAT.astype(np.int64)
+    return best_labels
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='train', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--name', type=str, default='Cora')  # Citeseer, Cora
+    parser.add_argument('--data_pt', type=str, default=None, help='Path to PyG data.pt with x, y and edge_index')
+    parser.add_argument('--output_dir', type=str, default='outputs')
+    parser.add_argument('--epochs', type=int, default=400, help='Self-supervised training epochs')
+    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])
+    parser.add_argument('--pretrain_path', type=str, default=None)
     # parser.add_argument('--epoch', type=int, default=30)  # 预训练模型中的epoch
     parser.add_argument('--max_epoch', type=int, default=100)
     parser.add_argument('--lr', type=float, default=0.0001)
-    parser.add_argument('--n_clusters', default=6, type=int)
+    parser.add_argument('--n_clusters', default=None, type=int)
     parser.add_argument('--update_interval', default=1, type=int)  # [1,3,5]
     parser.add_argument('--hidden_size', default=256, type=int)
     parser.add_argument('--embedding_size', default=16, type=int)
@@ -145,14 +164,21 @@ if __name__ == "__main__":
     if os.path.exists('pretrain/') == False:  #
         os.makedirs('pretrain/')
 
-    args.cuda = torch.cuda.is_available()
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested with --device cuda, but it is not available.")
+    args.cuda = args.device == 'cuda'
     print("use cuda: {}".format(args.cuda))
-    device = torch.device("cuda" if args.cuda else "cpu")
+    device = torch.device(args.device)
 
-    datasets = utils.get_dataset(args.name)
-    dataset = datasets[0]
+    if args.data_pt:
+        dataset = utils.load_data_pt(args.data_pt)
+    else:
+        datasets = utils.get_dataset(args.name)
+        dataset = datasets[0]
 
-    if args.name == 'Citeseer':
+    if args.data_pt:
+        args.k = None
+    elif args.name == 'Citeseer':
         args.lr = 0.0001
         args.k = None
         args.n_clusters = 6
@@ -167,11 +193,17 @@ if __name__ == "__main__":
     else:
         args.k = None
 
-    args.pretrain_path = f'pretrain/GAE_{args.name}.pkl'
+    if args.pretrain_path is None:
+        args.pretrain_path = f'pretrain/GAE_{args.name}.pkl'
     args.input_dim = dataset.num_features
+    if args.data_pt and args.n_clusters is None:
+        args.n_clusters = int(torch.unique(dataset.y).numel())
 
     print(args)
-    trainer(dataset)
-
-
+    labels = trainer(dataset)
+    os.makedirs(args.output_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M")
+    labels_path = os.path.join(args.output_dir, "DSAGC_{}_labels.npy".format(timestamp))
+    np.save(labels_path, labels.astype(np.int64))
+    print("DSAGC labels saved in: {}".format(labels_path))
 
